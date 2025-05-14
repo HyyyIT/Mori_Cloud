@@ -1,0 +1,20 @@
+.venv
+venv
+# photo/
+# store/
+# ignore all files .bin in store
+# store/*.bin
+.env
+__pycache__
+db.sqlite3
+migrations/
+**/migrations/*.py
+*.pyc
+/*.pyc
+**/migrations/*.pyc
+data_mori/
+mori/.env
+mori/mori/db_mori/data/
+# Ignore all .env files
+.env
+*/.env
