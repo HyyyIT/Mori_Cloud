@@ -5,19 +5,22 @@ import numpy as np
 from PIL import Image
 import open_clip
 from django.conf import settings
+from sentence_transformers import SentenceTransformer
+from concurrent.futures import ThreadPoolExecutor
 from .models import Photo
 import time
+import logging
+from tqdm import tqdm
+from django.utils import timezone
 
 class FaissImageIndexer:
-    def __init__(self, user=None):
+    def __init__(self, user=None, model_name='clip-ViT-B-32', feature_dim=512, chunk_size=256):
         self.device = "cpu"
-        self.feature_dim = 768
+        self.feature_dim = feature_dim
+        self.chunk_size = chunk_size
         self.user = user
         self.index = self.load_faiss_index()
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            'ViT-L-14', device=self.device, pretrained='datacomp_xl_s13b_b90k'
-        )
-        self.tokenizer = open_clip.get_tokenizer('ViT-L-14')
+        self.model = SentenceTransformer(model_name, device=self.device)
 
     @property
     def faiss_index_path(self):
@@ -57,24 +60,30 @@ class FaissImageIndexer:
         except Exception as e:
             print(f"❌ Lỗi khi lưu FAISS index: {e}")
 
-    def extract_image_features(self, image_path):
-        """Trích xuất đặc trưng ảnh"""
+    def load_and_preprocess(self, path):
         try:
-            if not os.path.exists(image_path):
-                print(f"❌ Ảnh không tồn tại: {image_path}")
+            if not os.path.exists(path):
+                print(f"❌ Ảnh không tồn tại: {path}")
                 return None
-
-            image = Image.open(image_path).convert("RGB")
-            image_input = self.preprocess(image).to(self.device).unsqueeze(0)
-
-            with torch.no_grad():
-                image_features = self.model.encode_image(image_input)
-
-            image_features /= image_features.norm(dim=-1, keepdim=True)
-            return image_features.cpu().detach().numpy().astype(np.float32)
+            image = Image.open(path).convert("RGB")
+            return image
         except Exception as e:
-            print(f"❌ Lỗi khi trích xuất đặc trưng ảnh: {e}")
+            print(f"❌ Lỗi đọc ảnh {path}: {e}")
             return None
+
+    def extract_image_features_chunk(self, image_paths):
+        with ThreadPoolExecutor() as executor:
+            images = list(executor.map(self.load_and_preprocess, image_paths))
+
+        valid_images = [img for img in images if img is not None]
+        if not valid_images:
+            raise ValueError("❌ Không có ảnh hợp lệ trong chunk!")
+
+        with torch.no_grad():
+            features = self.model.encode(valid_images, batch_size=len(valid_images), convert_to_numpy=True)
+
+        features = features / np.linalg.norm(features, axis=-1, keepdims=True)
+        return features.astype(np.float32)
 
     def add_photo_to_faiss(self, photo):
         try:
@@ -82,24 +91,23 @@ class FaissImageIndexer:
                 print(f"❌ Ảnh không tồn tại: {photo.photo.path}")
                 return False
 
-            feature_vector = self.extract_image_features(photo.photo.path)
-            if feature_vector is None:
-                print(f"⚠️ Ảnh {photo   .id_photo} không thể trích xuất đặc trưng.")
+            feature_vector = self.extract_image_features_chunk([photo.photo.path])
+            if feature_vector is None or len(feature_vector) == 0:
+                print(f"⚠️ Ảnh {photo.id_photo} không thể trích xuất đặc trưng.")
                 return False
-            # Chỉ tạo FAISS mới nếu hoàn toàn chưa tồn tại
+
+            if feature_vector.shape[1] != self.feature_dim:
+                print(f"❌ Kích thước vector của ảnh {photo.id_photo} ({feature_vector.shape[1]}) "
+                      f"không khớp với FAISS ({self.feature_dim}) → Bỏ qua ảnh này.")
+                return False
+
             if self.index is None:
                 print(f"⚠️ FAISS chưa tồn tại → Tạo FAISS mới")
-                self.index = faiss.IndexFlatIP(feature_vector.shape[1])
-                self.index.add(feature_vector)
-                faiss_id = self.index.ntotal - 1
-            else:
-                # Kiểm tra kích thước vector trước khi ghi vào FAISS
-                if feature_vector.shape[1] != self.index.d:
-                    print(f"❌ Kích thước vector của ảnh {photo.id_photo} ({feature_vector.shape[1]}) "
-                        f"không khớp với FAISS ({self.index.d}) → Bỏ qua ảnh này.")
-                    return False
-                faiss_id = self.index.ntotal
-                self.index.add(feature_vector)
+                self.index = faiss.IndexFlatIP(self.feature_dim)
+            
+            faiss_id = self.index.ntotal
+            self.index.add(feature_vector)
+
             if self.user is None:
                 print(f"FAISS index global: {faiss_id}")
                 photo.faiss_id_public = faiss_id
@@ -107,13 +115,36 @@ class FaissImageIndexer:
                 print(f"FAISS index user {self.user.id_user}: {faiss_id}")
                 photo.faiss_id = faiss_id
             photo.save()
-            if photo.faiss_id is None:
+
+            if photo.faiss_id is None and self.user is not None:
                 raise ValueError(f"❌ Không thể cập nhật faiss_id cho ảnh {photo.id_photo}")
-            # Lưu lại FAISS index sau khi thêm ảnh mới
+
             self.save_faiss_index(self.index)
-            time.sleep(0.5)  # Đảm bảo FAISS đã được lưu
             print(f"✅ Ảnh {photo.id_photo} đã được thêm vào FAISS với ID: {faiss_id}")
             return faiss_id
         except Exception as e:
             print(f"❌ Lỗi khi thêm ảnh vào FAISS: {e}")
             return False
+        
+    def add_images(self, photos):
+        image_paths = [photo.photo.path for photo in photos]
+        print(f"🔄 Bắt đầu trích xuất & thêm vào FAISS index với chunk size = {self.chunk_size}")
+        for i in tqdm(range(0, len(image_paths), self.chunk_size), desc="🔄 Trích xuất & Thêm chunk"):
+            chunk_paths = image_paths[i:i + self.chunk_size]
+            chunk_photos = photos[i:i + self.chunk_size]
+            try:
+                features = self.extract_image_features_chunk(chunk_paths)
+                start_id = self.index.ntotal
+                self.index.add(features)
+                for j, photo in enumerate(chunk_photos):
+                    faiss_id = start_id + j
+                    if self.user is None:
+                        photo.faiss_id_public = faiss_id
+                    else:
+                        photo.faiss_id = faiss_id
+                    photo.save()
+                    print(f"✅ Ảnh {photo.id_photo} đã được thêm vào FAISS với ID: {faiss_id}")
+            except Exception as e:
+                print(f"❌ Lỗi khi xử lý chunk {chunk_paths}: {e}")
+        self.save_faiss_index()
+        
